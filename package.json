@@ -1,0 +1,70 @@
+{
+  "name": "AIEngineeringAssistant",
+  "displayName": "DevPilot",
+  "description": "AI-powered coding assistant for bug investigation, code generation, testing, and review.",
+  "version": "0.1.0",
+  "publisher": "devpilot",
+  "engines": {
+    "vscode": "^1.140.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:devpilot.view",
+    "onCommand:devpilot.open",
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "devpilot-sidebar",
+          "title": "DevPilot",
+          "icon": "media/icons/devpilot.svg"
+        }
+      ]
+    },
+    "views": {
+      "devpilot-sidebar": [
+        {
+          "type": "webview",
+          "id": "devpilot.view",
+          "name": ""
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "devpilot.open",
+        "title": "Open",
+        "category": "DevPilot"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "@types/vscode": "^1.140.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "^4.0.0",
+    "eslint": "^10.5.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}

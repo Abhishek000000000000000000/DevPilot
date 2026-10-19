@@ -3,8 +3,25 @@ import {
 	WebviewToExtensionMessage,
 	ExtensionToWebviewMessage,
 	ReadyResponse,
-	AssistantResponse
+	AssistantResponse,
+	ChatChunkMessage,
+	ChatCompleteMessage,
+	ChatErrorMessage,
+	validateWebviewMessage
 } from '../types/messages.js';
+import { ILLMProvider } from '../providers/ILLMProvider.js';
+import { ChatRequest, StreamChunk } from '../providers/types.js';
+import { ProviderError } from '../providers/errors.js';
+import { OllamaProvider } from '../providers/ollama/OllamaProvider.js';
+import { getOllamaConfigFromVSCode } from '../providers/ollama/vscodeConfig.js';
+
+interface ActiveRequestRecord {
+	readonly requestId: string;
+	readonly abortController: AbortController;
+	accumulatedText: string;
+	isCancelled: boolean;
+	isCompleted: boolean;
+}
 
 /**
  * Manages the DevPilot WebviewView rendered in the VS Code Sidebar / Auxiliary Bar.
@@ -14,9 +31,62 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 	public static currentProvider: DevPilotViewProvider | undefined;
 
 	private _view?: vscode.WebviewView;
+	private _customProvider?: ILLMProvider;
+	private _activeRequests = new Map<string, ActiveRequestRecord>();
+	private _finalizedRequests = new Map<string, 'completed' | 'cancelled' | 'error'>();
 
-	constructor(private readonly _extensionUri: vscode.Uri) {
+	constructor(
+		private readonly _extensionUri: vscode.Uri,
+		customProvider?: ILLMProvider
+	) {
 		DevPilotViewProvider.currentProvider = this;
+		this._customProvider = customProvider;
+	}
+
+	private _recordFinalized(requestId: string, status: 'completed' | 'cancelled' | 'error'): void {
+		this._finalizedRequests.set(requestId, status);
+		if (this._finalizedRequests.size > 100) {
+			const oldestKey = this._finalizedRequests.keys().next().value;
+			if (oldestKey) {
+				this._finalizedRequests.delete(oldestKey);
+			}
+		}
+	}
+
+	/**
+	 * Retrieves the active LLM provider (custom injected or configured OllamaProvider).
+	 */
+	public getProvider(): ILLMProvider {
+		if (this._customProvider) {
+			return this._customProvider;
+		}
+		return new OllamaProvider(getOllamaConfigFromVSCode());
+	}
+
+	/**
+	 * Sets or clears a custom provider (used for test mocking).
+	 */
+	public setCustomProvider(provider: ILLMProvider | undefined): void {
+		this._customProvider = provider;
+	}
+
+	/**
+	 * Returns the number of currently active in-flight requests.
+	 */
+	public getActiveRequestCount(): number {
+		return this._activeRequests.size;
+	}
+
+	/**
+	 * Aborts and cancels all active in-flight requests.
+	 */
+	public cancelAllRequests(): void {
+		for (const [id, activeReq] of this._activeRequests.entries()) {
+			activeReq.isCancelled = true;
+			activeReq.abortController.abort();
+			this._recordFinalized(id, 'cancelled');
+		}
+		this._activeRequests.clear();
 	}
 
 	public resolveWebviewView(
@@ -37,13 +107,14 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 
 		// Handle messages sent from the Webview UI
 		webviewView.webview.onDidReceiveMessage(
-			(message: unknown) => {
-				this.handleMessage(message);
+			async (message: unknown) => {
+				await this.handleMessage(message);
 			}
 		);
 
 		webviewView.onDidDispose(() => {
 			this._view = undefined;
+			this.cancelAllRequests();
 		});
 	}
 
@@ -58,23 +129,40 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
+	private _onDidPostMessage?: (message: ExtensionToWebviewMessage) => void;
+
+	/**
+	 * Diagnostic and test hook allowing callers to observe messages posted to the Webview.
+	 */
+	public setOnDidPostMessage(listener?: (message: ExtensionToWebviewMessage) => void): void {
+		this._onDidPostMessage = listener;
+	}
+
 	/**
 	 * Post a typed message to the Webview UI.
 	 */
 	public postMessage(message: ExtensionToWebviewMessage): Thenable<boolean> | undefined {
+		this._onDidPostMessage?.(message);
 		return this._view?.webview.postMessage(message);
 	}
 
 	/**
 	 * Process and handle messages arriving from the Webview UI.
 	 */
-	public handleMessage(message: unknown): ExtensionToWebviewMessage | void {
-		if (!message || typeof message !== 'object') {
-			console.warn('[DevPilot] Received malformed message:', message);
+	public async handleMessage(message: unknown): Promise<ExtensionToWebviewMessage | void> {
+		// Handle legacy webview command syntax if present
+		if (message && typeof message === 'object' && (message as { command?: string }).command === 'close') {
+			vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
 			return;
 		}
 
-		const msg = message as WebviewToExtensionMessage;
+		const validation = validateWebviewMessage(message);
+		if (!validation.valid) {
+			console.warn('[DevPilot] Ignored invalid webview message:', validation.error);
+			return;
+		}
+
+		const msg = validation.message;
 
 		switch (msg.type) {
 			case 'devpilot.ready': {
@@ -90,37 +178,210 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 				return response;
 			}
 
-			case 'devpilot.message': {
-				const text = msg.payload?.text?.trim();
-				if (!text) {
-					console.warn('[DevPilot] Ignored empty or missing message payload.');
-					return;
+			case 'devpilot.chat.send': {
+				const requestId = msg.payload.requestId;
+				const promptText = msg.payload.text;
+				console.log(`[DevPilot] Processing chat.send [${requestId}]`);
+
+				// Reject duplicate active requestId without overwriting running request
+				if (this._activeRequests.has(requestId)) {
+					console.warn(`[DevPilot] Ignored duplicate active chat.send for [${requestId}]`);
+					const errorResponse: ChatErrorMessage = {
+						type: 'devpilot.chat.error',
+						payload: {
+							requestId,
+							code: 'INVALID_PAYLOAD',
+							message: `Request [${requestId}] is already active.`
+						}
+					};
+					this.postMessage(errorResponse);
+					return errorResponse;
 				}
 
-				console.log(`Received message: ${text}`);
+				const abortController = new AbortController();
+				const activeRequest: ActiveRequestRecord = {
+					requestId,
+					abortController,
+					accumulatedText: '',
+					isCancelled: false,
+					isCompleted: false
+				};
+				this._activeRequests.set(requestId, activeRequest);
 
-				const response: AssistantResponse = {
-					type: 'devpilot.response',
+				try {
+					const provider = this.getProvider();
+					const chatRequest: ChatRequest = {
+						messages: [{ role: 'user', content: promptText }]
+					};
+
+					const result = await provider.chatStream(
+						chatRequest,
+						(chunk: StreamChunk) => {
+							if (activeRequest.isCancelled) {
+								return;
+							}
+							if (chunk && chunk.text && chunk.text.length > 0) {
+								activeRequest.accumulatedText += chunk.text;
+								const chunkMessage: ChatChunkMessage = {
+									type: 'devpilot.chat.chunk',
+									payload: {
+										requestId,
+										text: chunk.text
+									}
+								};
+								this.postMessage(chunkMessage);
+							}
+						},
+						abortController.signal
+					);
+
+					if (activeRequest.isCancelled) {
+						return;
+					}
+
+					activeRequest.isCompleted = true;
+					this._activeRequests.delete(requestId);
+					this._recordFinalized(requestId, 'completed');
+
+					const outputText = result.text.trim().length > 0
+						? result.text
+						: '(No output generated by model)';
+
+					const response: ChatCompleteMessage = {
+						type: 'devpilot.chat.complete',
+						payload: {
+							requestId,
+							fullText: outputText,
+							finishReason: result.finishReason
+						}
+					};
+					this.postMessage(response);
+					return response;
+				} catch (err) {
+					this._activeRequests.delete(requestId);
+
+					// If cancelled by user, suppress error event
+					if (activeRequest.isCancelled || (err instanceof ProviderError && err.code === 'REQUEST_CANCELLED')) {
+						console.log(`[DevPilot] Request [${requestId}] was cancelled by user; suppressing error event.`);
+						this._recordFinalized(requestId, 'cancelled');
+						return;
+					}
+
+					this._recordFinalized(requestId, 'error');
+
+					const code = err instanceof ProviderError ? err.code : 'PROVIDER_ERROR';
+					const messageText = err instanceof Error ? err.message : 'An unexpected error occurred.';
+					const suggestion = err instanceof ProviderError ? err.userSuggestion : undefined;
+
+					const errorResponse: ChatErrorMessage = {
+						type: 'devpilot.chat.error',
+						payload: {
+							requestId,
+							code,
+							message: messageText,
+							suggestion
+						}
+					};
+					this.postMessage(errorResponse);
+					return errorResponse;
+				}
+			}
+
+			case 'devpilot.chat.cancel': {
+				const requestId = msg.payload.requestId;
+				console.log(`[DevPilot] Received chat.cancel for [${requestId}]`);
+				const activeReq = this._activeRequests.get(requestId);
+				if (activeReq) {
+					if (activeReq.isCancelled) {
+						return;
+					}
+					activeReq.isCancelled = true;
+					activeReq.abortController.abort();
+					this._activeRequests.delete(requestId);
+					this._recordFinalized(requestId, 'cancelled');
+
+					const cancelResponse: ChatCompleteMessage = {
+						type: 'devpilot.chat.complete',
+						payload: {
+							requestId,
+							fullText: activeReq.accumulatedText,
+							finishReason: 'cancelled'
+						}
+					};
+					this.postMessage(cancelResponse);
+					return cancelResponse;
+				}
+
+				// If already finalized (e.g. completed or errored), do not post a conflicting terminal event to webview
+				const previousOutcome = this._finalizedRequests.get(requestId);
+				if (previousOutcome) {
+					console.log(`[DevPilot] Request [${requestId}] was already finalized as [${previousOutcome}]; ignoring late cancel`);
+					return {
+						type: 'devpilot.chat.complete',
+						payload: {
+							requestId,
+							fullText: '',
+							finishReason: 'cancelled'
+						}
+					};
+				}
+
+				// Idempotent cancellation response for already-finished or untracked request
+				const response: ChatCompleteMessage = {
+					type: 'devpilot.chat.complete',
 					payload: {
-						text: 'DevPilot received your request.'
+						requestId,
+						fullText: '',
+						finishReason: 'cancelled'
 					}
 				};
 				this.postMessage(response);
 				return response;
 			}
 
+			case 'devpilot.message': {
+				const promptText = msg.payload.text;
+				console.log('[DevPilot] Processing legacy message prompt...');
+
+				try {
+					const provider = this.getProvider();
+					const chatRequest: ChatRequest = {
+						messages: [{ role: 'user', content: promptText }]
+					};
+
+					const result = await provider.chatStream(chatRequest, () => {});
+					const outputText = result.text.trim().length > 0
+						? result.text
+						: '(No output generated by model)';
+
+					const response: AssistantResponse = {
+						type: 'devpilot.response',
+						payload: {
+							text: outputText
+						}
+					};
+					this.postMessage(response);
+					return response;
+				} catch (err) {
+					const code = err instanceof ProviderError ? err.code : 'PROVIDER_ERROR';
+					const messageText = err instanceof Error ? err.message : 'An unexpected error occurred.';
+					const suggestion = err instanceof ProviderError ? err.userSuggestion : undefined;
+
+					const errorText = `⚠️ Error [${code}]: ${messageText}${suggestion ? `\n\n💡 Suggestion: ${suggestion}` : ''}`;
+					const errorResponse: AssistantResponse = {
+						type: 'devpilot.response',
+						payload: {
+							text: errorText
+						}
+					};
+					this.postMessage(errorResponse);
+					return errorResponse;
+				}
+			}
+
 			case 'devpilot.close': {
 				// Hide / collapse the secondary sidebar view
 				vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
-				return;
-			}
-
-			default: {
-				if ((message as { command?: string }).command === 'close') {
-					vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
-					return;
-				}
-				console.warn('[DevPilot] Received unknown message type:', message);
 				return;
 			}
 		}
@@ -243,11 +504,18 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 							</svg>
 						</button>
 					</div>
-					<button class="composer-send-btn" id="composer-send" title="Send Message">
-						<svg viewBox="0 0 24 24" fill="currentColor">
-							<path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
-						</svg>
-					</button>
+					<div class="composer-actions-right">
+						<button class="composer-stop-btn" id="composer-stop" title="Stop Generation" style="display: none;" aria-label="Stop Generation">
+							<svg viewBox="0 0 24 24" fill="currentColor">
+								<rect x="6" y="6" width="12" height="12" rx="2"></rect>
+							</svg>
+						</button>
+						<button class="composer-send-btn" id="composer-send" title="Send Message">
+							<svg viewBox="0 0 24 24" fill="currentColor">
+								<path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+							</svg>
+						</button>
+					</div>
 				</div>
 			</div>
 		</footer>

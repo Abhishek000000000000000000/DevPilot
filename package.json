@@ -41,7 +41,27 @@
         "title": "Open",
         "category": "DevPilot"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "DevPilot",
+      "properties": {
+        "devpilot.ollama.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL of the local Ollama server."
+        },
+        "devpilot.ollama.model": {
+          "type": "string",
+          "default": "qwen3.5:9b",
+          "description": "Model identifier to use with Ollama."
+        },
+        "devpilot.ollama.timeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "description": "Request timeout in milliseconds for Ollama operations."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

@@ -59,6 +59,11 @@
           "type": "number",
           "default": 120000,
           "description": "Request timeout in milliseconds for Ollama operations."
+        },
+        "devpilot.ollama.think": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable internal thinking/reasoning output from reasoning-capable Ollama models. Disabling thinking significantly reduces response latency."
         }
       }
     }

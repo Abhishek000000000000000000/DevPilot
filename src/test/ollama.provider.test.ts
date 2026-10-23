@@ -1,10 +1,11 @@
 import * as assert from 'assert';
-import { OllamaProvider } from '../providers/ollama/OllamaProvider.js';
+import { OllamaProvider, parseOllamaMetrics } from '../providers/ollama/OllamaProvider.js';
 import {
 	validateOllamaConfig,
 	DEFAULT_OLLAMA_BASE_URL,
 	DEFAULT_OLLAMA_MODEL,
-	DEFAULT_OLLAMA_TIMEOUT_MS
+	DEFAULT_OLLAMA_TIMEOUT_MS,
+	DEFAULT_OLLAMA_THINK
 } from '../providers/ollama/OllamaConfig.js';
 import { ProviderError } from '../providers/errors.js';
 import { ChatRequest, StreamChunk } from '../providers/types.js';
@@ -51,6 +52,7 @@ suite('OllamaProvider & Configuration Test Suite', () => {
 		assert.strictEqual(provider.config.baseUrl, DEFAULT_OLLAMA_BASE_URL);
 		assert.strictEqual(provider.config.model, DEFAULT_OLLAMA_MODEL);
 		assert.strictEqual(provider.config.timeoutMs, DEFAULT_OLLAMA_TIMEOUT_MS);
+		assert.strictEqual(provider.config.think, false);
 	});
 
 	// 2. Valid configuration and invalid configuration values
@@ -59,11 +61,22 @@ suite('OllamaProvider & Configuration Test Suite', () => {
 		const custom = validateOllamaConfig({
 			baseUrl: 'http://127.0.0.1:11434/',
 			model: 'llama3:8b',
-			timeoutMs: 45000
+			timeoutMs: 45000,
+			think: true
 		});
 		assert.strictEqual(custom.baseUrl, 'http://127.0.0.1:11434'); // Trailing slash stripped
 		assert.strictEqual(custom.model, 'llama3:8b');
 		assert.strictEqual(custom.timeoutMs, 45000);
+		assert.strictEqual(custom.think, true);
+
+		// Default think is false
+		const withoutThink = validateOllamaConfig({});
+		assert.strictEqual(withoutThink.think, false);
+
+		// Invalid think
+		assert.throws(() => {
+			validateOllamaConfig({ think: 'invalid' as any });
+		}, /Ollama think option must be a boolean/);
 
 		// Invalid URL
 		assert.throws(() => {
@@ -580,6 +593,394 @@ suite('OllamaProvider & Configuration Test Suite', () => {
 				return true;
 			}
 		);
+	});
+
+	// 23. Request payload includes think: false by default
+	test('23. Request payload includes think: false by default', async () => {
+		let capturedBody: any;
+		const mockFetch: typeof fetch = async (_input, init) => {
+			capturedBody = JSON.parse(init?.body as string);
+			const doneLine = JSON.stringify({ message: { role: 'assistant', content: 'Result' }, done: true, done_reason: 'stop' }) + '\n';
+			return createMockStreamResponse([doneLine]);
+		};
+
+		const provider = new OllamaProvider({}, mockFetch);
+		await provider.chatStream(sampleRequest, () => {});
+
+		assert.ok(capturedBody);
+		assert.strictEqual(capturedBody.think, false);
+	});
+
+	// 24. Request payload includes think: true when configured
+	test('24. Request payload includes think: true when configured', async () => {
+		let capturedBody: any;
+		const mockFetch: typeof fetch = async (_input, init) => {
+			capturedBody = JSON.parse(init?.body as string);
+			const doneLine = JSON.stringify({ message: { role: 'assistant', content: 'Result' }, done: true, done_reason: 'stop' }) + '\n';
+			return createMockStreamResponse([doneLine]);
+		};
+
+		const provider = new OllamaProvider({ think: true }, mockFetch);
+		await provider.chatStream(sampleRequest, () => {});
+
+		assert.ok(capturedBody);
+		assert.strictEqual(capturedBody.think, true);
+	});
+
+	// 25. A healthy stream spanning longer than timeoutMs overall completes successfully
+	test('25. Healthy stream spanning longer than timeoutMs overall completes successfully', async () => {
+		const encoder = new TextEncoder();
+		let chunkIdx = 0;
+		const chunks = [
+			JSON.stringify({ message: { role: 'assistant', content: 'Chunk1 ' }, done: false }) + '\n',
+			JSON.stringify({ message: { role: 'assistant', content: 'Chunk2 ' }, done: false }) + '\n',
+			JSON.stringify({ message: { role: 'assistant', content: 'Chunk3' }, done: true, done_reason: 'stop' }) + '\n'
+		];
+
+		const customStream = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				if (chunkIdx < chunks.length) {
+					// 500ms delay between chunks (each interval is < 1000ms timeoutMs, but total 1500ms > 1000ms)
+					await new Promise(r => setTimeout(r, 500));
+					controller.enqueue(encoder.encode(chunks[chunkIdx++]));
+				} else {
+					controller.close();
+				}
+			}
+		});
+
+		const mockFetch: typeof fetch = async () => {
+			return new Response(customStream, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } });
+		};
+
+		const provider = new OllamaProvider({ timeoutMs: 1000 }, mockFetch);
+		const received: string[] = [];
+		const result = await provider.chatStream(sampleRequest, c => received.push(c.text));
+
+		assert.deepStrictEqual(received, ['Chunk1 ', 'Chunk2 ', 'Chunk3']);
+		assert.strictEqual(result.text, 'Chunk1 Chunk2 Chunk3');
+	});
+
+	// 26. A stream that stalls beyond timeoutMs fails with TIMEOUT
+	test('26. Stream that stalls mid-stream beyond timeoutMs fails with TIMEOUT', async () => {
+		const encoder = new TextEncoder();
+		let chunkIdx = 0;
+
+		const customStream = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				chunkIdx++;
+				if (chunkIdx === 1) {
+					const chunk = JSON.stringify({ message: { role: 'assistant', content: 'Start ' }, done: false }) + '\n';
+					controller.enqueue(encoder.encode(chunk));
+				} else {
+					// Stall indefinitely without closing or enqueuing
+					await new Promise(() => {});
+				}
+			}
+		});
+
+		const mockFetch: typeof fetch = async () => {
+			return new Response(customStream, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } });
+		};
+
+		const provider = new OllamaProvider({ timeoutMs: 1000 }, mockFetch);
+		const received: string[] = [];
+
+		await assert.rejects(
+			async () => {
+				await provider.chatStream(sampleRequest, c => received.push(c.text));
+			},
+			(err: unknown) => {
+				assert.ok(err instanceof ProviderError);
+				assert.strictEqual(err.code, 'TIMEOUT');
+				assert.ok(err.message.includes('1000ms of inactivity'));
+				return true;
+			}
+		);
+
+		assert.strictEqual(received.length, 1);
+		assert.strictEqual(received[0], 'Start ');
+	});
+
+	// 27. Thinking-only chunks reset activity timeout and do not leak to onChunk
+	test('27. Thinking-only chunks reset activity timeout and do not emit text to onChunk', async () => {
+		const encoder = new TextEncoder();
+		let pullCount = 0;
+		const stream = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				pullCount++;
+				if (pullCount === 1) {
+					// Thinking chunk at 500ms
+					await new Promise(r => setTimeout(r, 500));
+					const thinkChunk = JSON.stringify({ message: { role: 'assistant', content: '', thinking: 'Analyzing problem...' }, done: false }) + '\n';
+					controller.enqueue(encoder.encode(thinkChunk));
+				} else if (pullCount === 2) {
+					// Content chunk at another 500ms (total 1000ms > 1000ms total elapsed)
+					await new Promise(r => setTimeout(r, 500));
+					const contentChunk = JSON.stringify({ message: { role: 'assistant', content: 'Final answer' }, done: true, done_reason: 'stop' }) + '\n';
+					controller.enqueue(encoder.encode(contentChunk));
+				} else {
+					controller.close();
+				}
+			}
+		});
+
+		const mockFetch: typeof fetch = async () => {
+			return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } });
+		};
+
+		const provider = new OllamaProvider({ timeoutMs: 1000 }, mockFetch);
+		const received: string[] = [];
+		const result = await provider.chatStream(sampleRequest, c => received.push(c.text));
+
+		// Thinking text must NOT be emitted to onChunk
+		assert.deepStrictEqual(received, ['Final answer']);
+		assert.strictEqual(result.text, 'Final answer');
+	});
+
+	// 28. Initial connection / response stall is aborted with TIMEOUT
+	test('28. Initial connection stall triggers TIMEOUT ProviderError', async () => {
+		const mockFetch: typeof fetch = async (_input, init) => {
+			return new Promise((_resolve, reject) => {
+				init?.signal?.addEventListener('abort', () => {
+					const err = new Error('The operation was aborted');
+					err.name = 'AbortError';
+					reject(err);
+				});
+			});
+		};
+
+		const provider = new OllamaProvider({ timeoutMs: 1000 }, mockFetch);
+
+		await assert.rejects(
+			async () => {
+				await provider.chatStream(sampleRequest, () => {});
+			},
+			(err: unknown) => {
+				assert.ok(err instanceof ProviderError);
+				assert.strictEqual(err.code, 'TIMEOUT');
+				return true;
+			}
+		);
+	});
+
+	// 29. User cancellation while stream is pending throws REQUEST_CANCELLED instead of TIMEOUT
+	test('29. User cancellation while stream is pending throws REQUEST_CANCELLED instead of TIMEOUT', async () => {
+		const abortController = new AbortController();
+		const customStream = new ReadableStream<Uint8Array>({
+			async pull() {
+				// Pending forever
+				await new Promise(() => {});
+			}
+		});
+
+		const mockFetch: typeof fetch = async () => {
+			return new Response(customStream, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } });
+		};
+
+		const provider = new OllamaProvider({ timeoutMs: 10000 }, mockFetch);
+
+		// Cancel after 100ms, well before the 10000ms timeout
+		setTimeout(() => abortController.abort(), 100);
+
+		await assert.rejects(
+			async () => {
+				await provider.chatStream(sampleRequest, () => {}, abortController.signal);
+			},
+			(err: unknown) => {
+				assert.ok(err instanceof ProviderError);
+				assert.strictEqual(err.code, 'REQUEST_CANCELLED');
+				return true;
+			}
+		);
+	});
+
+	// 30. Clean release of reader locks and timers
+	test('30. Stream completion releases reader locks and cleans up timers without leak', async () => {
+		let lockReleased = false;
+		const encoder = new TextEncoder();
+		const doneLine = JSON.stringify({ message: { role: 'assistant', content: 'Finished' }, done: true, done_reason: 'stop' }) + '\n';
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode(doneLine));
+				controller.close();
+			}
+		});
+
+		const origGetReader = stream.getReader.bind(stream);
+		(stream as any).getReader = () => {
+			const reader = origGetReader();
+			const origRelease = reader.releaseLock.bind(reader);
+			reader.releaseLock = () => {
+				lockReleased = true;
+				origRelease();
+			};
+			return reader;
+		};
+
+		const mockFetch: typeof fetch = async () => {
+			return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } });
+		};
+
+		const provider = new OllamaProvider({ timeoutMs: 5000 }, mockFetch);
+		const result = await provider.chatStream(sampleRequest, () => {});
+
+		assert.strictEqual(result.text, 'Finished');
+		assert.strictEqual(lockReleased, true, 'Reader lock must be released in finally block');
+	});
+
+	// 31. parseOllamaMetrics with valid metrics, explicit ns -> ms conversion and speed calculation
+	test('31. parseOllamaMetrics converts units explicitly and computes tokensPerSecond', () => {
+		const raw = {
+			eval_count: 120,
+			eval_duration: 5_000_000_000, // 5.0 seconds in ns
+			prompt_eval_count: 25,
+			prompt_eval_duration: 250_000_000, // 250 ms in ns
+			total_duration: 5_300_000_000, // 5300 ms in ns
+			load_duration: 50_000_000 // 50 ms in ns
+		};
+
+		const metrics = parseOllamaMetrics(raw);
+		assert.ok(metrics, 'Metrics must be defined for valid raw input');
+		assert.strictEqual(metrics.evalCount, 120);
+		assert.strictEqual(metrics.evalDurationMs, 5000);
+		assert.strictEqual(metrics.promptEvalCount, 25);
+		assert.strictEqual(metrics.promptEvalDurationMs, 250);
+		assert.strictEqual(metrics.totalDurationMs, 5300);
+		assert.strictEqual(metrics.loadDurationMs, 50);
+		// Speed = 120 / (5_000_000_000 / 1e9) = 120 / 5 = 24 tokens/sec
+		assert.strictEqual(metrics.tokensPerSecond, 24);
+	});
+
+	// 32. parseOllamaMetrics with zero inference duration prevents division by zero
+	test('32. parseOllamaMetrics handles zero eval_duration safely without division by zero', () => {
+		const raw = {
+			eval_count: 10,
+			eval_duration: 0,
+			total_duration: 100_000_000
+		};
+
+		const metrics = parseOllamaMetrics(raw);
+		assert.ok(metrics);
+		assert.strictEqual(metrics.evalCount, 10);
+		assert.strictEqual(metrics.evalDurationMs, 0);
+		assert.strictEqual(metrics.tokensPerSecond, undefined, 'Speed must be undefined when duration is 0');
+		assert.strictEqual(metrics.totalDurationMs, 100);
+	});
+
+	// 33. parseOllamaMetrics returns undefined when no valid metrics are present
+	test('33. parseOllamaMetrics returns undefined when no metrics are provided', () => {
+		assert.strictEqual(parseOllamaMetrics(undefined), undefined);
+		assert.strictEqual(parseOllamaMetrics({}), undefined);
+		assert.strictEqual(parseOllamaMetrics(null as any), undefined);
+	});
+
+	// 34. parseOllamaMetrics safely filters negative, NaN, and Infinity values
+	test('34. parseOllamaMetrics rejects negative, NaN, and non-finite values', () => {
+		const raw = {
+			eval_count: -50,
+			eval_duration: -1000,
+			prompt_eval_count: NaN,
+			prompt_eval_duration: Infinity,
+			total_duration: -Infinity
+		};
+
+		const metrics = parseOllamaMetrics(raw);
+		assert.strictEqual(metrics, undefined, 'Invalid values must not produce metrics object');
+	});
+
+	// 35. parseOllamaMetrics safely filters non-numeric types
+	test('35. parseOllamaMetrics rejects non-numeric types like strings and booleans', () => {
+		const raw = {
+			eval_count: '120' as any,
+			eval_duration: true as any,
+			prompt_eval_count: {} as any
+		};
+
+		const metrics = parseOllamaMetrics(raw);
+		assert.strictEqual(metrics, undefined, 'String or boolean metrics must not be parsed');
+	});
+
+	// 36. parseOllamaMetrics handles partial metrics safely
+	test('36. parseOllamaMetrics handles partial metrics safely', () => {
+		const raw = {
+			prompt_eval_count: 42,
+			prompt_eval_duration: 150_000_000
+		};
+
+		const metrics = parseOllamaMetrics(raw);
+		assert.ok(metrics);
+		assert.strictEqual(metrics.promptEvalCount, 42);
+		assert.strictEqual(metrics.promptEvalDurationMs, 150);
+		assert.strictEqual(metrics.evalCount, undefined);
+		assert.strictEqual(metrics.tokensPerSecond, undefined);
+	});
+
+	// 37. Streaming integration: end-of-stream chunk with metrics populates result.metrics
+	test('37. chatStream captures metrics from the terminal Ollama stream chunk', async () => {
+		const encoder = new TextEncoder();
+		const chunk1 = JSON.stringify({ message: { role: 'assistant', content: 'Hello ' }, done: false }) + '\n';
+		const chunk2 = JSON.stringify({
+			message: { role: 'assistant', content: 'World!' },
+			done: true,
+			done_reason: 'stop',
+			eval_count: 50,
+			eval_duration: 2_000_000_000,
+			prompt_eval_count: 10,
+			prompt_eval_duration: 100_000_000,
+			total_duration: 2_200_000_000,
+			load_duration: 30_000_000
+		}) + '\n';
+
+		const mockFetch: typeof fetch = async () => {
+			const stream = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(encoder.encode(chunk1));
+					controller.enqueue(encoder.encode(chunk2));
+					controller.close();
+				}
+			});
+			return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } });
+		};
+
+		const provider = new OllamaProvider({}, mockFetch);
+		const chunks: StreamChunk[] = [];
+		const result = await provider.chatStream(sampleRequest, c => chunks.push(c));
+
+		assert.strictEqual(result.text, 'Hello World!');
+		assert.strictEqual(result.finishReason, 'stop');
+		assert.ok(result.metrics, 'Result metrics must be present');
+		assert.strictEqual(result.metrics.evalCount, 50);
+		assert.strictEqual(result.metrics.evalDurationMs, 2000);
+		assert.strictEqual(result.metrics.tokensPerSecond, 25);
+		assert.strictEqual(result.metrics.promptEvalCount, 10);
+		assert.strictEqual(result.metrics.promptEvalDurationMs, 100);
+		assert.strictEqual(result.metrics.totalDurationMs, 2200);
+		assert.strictEqual(result.metrics.loadDurationMs, 30);
+	});
+
+	// 38. Streaming integration: completion without metrics omits result.metrics
+	test('38. chatStream leaves metrics undefined when Ollama does not supply metrics', async () => {
+		const encoder = new TextEncoder();
+		const chunk1 = JSON.stringify({ message: { role: 'assistant', content: 'Plain ' }, done: false }) + '\n';
+		const chunk2 = JSON.stringify({ message: { role: 'assistant', content: 'response' }, done: true, done_reason: 'stop' }) + '\n';
+
+		const mockFetch: typeof fetch = async () => {
+			const stream = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(encoder.encode(chunk1));
+					controller.enqueue(encoder.encode(chunk2));
+					controller.close();
+				}
+			});
+			return new Response(stream, { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } });
+		};
+
+		const provider = new OllamaProvider({}, mockFetch);
+		const result = await provider.chatStream(sampleRequest, () => {});
+
+		assert.strictEqual(result.text, 'Plain response');
+		assert.strictEqual(result.metrics, undefined, 'Metrics must be undefined when not supplied');
 	});
 });
 

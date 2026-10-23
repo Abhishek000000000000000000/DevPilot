@@ -1,5 +1,5 @@
 import { ILLMProvider } from '../ILLMProvider.js';
-import { ChatRequest, ChatResponse, StreamChunk, ProviderHealth, ChatFinishReason } from '../types.js';
+import { ChatRequest, ChatResponse, StreamChunk, ProviderHealth, ChatFinishReason, GenerationMetrics } from '../types.js';
 import { ProviderError } from '../errors.js';
 import { OllamaConfig, validateOllamaConfig } from './OllamaConfig.js';
 
@@ -107,9 +107,30 @@ export class OllamaProvider implements ILLMProvider {
 		signal?: AbortSignal
 	): Promise<ChatResponse> {
 		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(new Error('TIMEOUT')), this._config.timeoutMs);
+		let isTimedOut = false;
+		let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-		const onAbort = () => controller.abort(signal?.reason);
+		const resetTimeout = () => {
+			if (timeoutId !== undefined) {
+				clearTimeout(timeoutId);
+			}
+			timeoutId = setTimeout(() => {
+				isTimedOut = true;
+				controller.abort(new Error('TIMEOUT'));
+			}, this._config.timeoutMs);
+		};
+
+		const clearTimeoutTimer = () => {
+			if (timeoutId !== undefined) {
+				clearTimeout(timeoutId);
+				timeoutId = undefined;
+			}
+		};
+
+		const onAbort = () => {
+			clearTimeoutTimer();
+			controller.abort(signal?.reason);
+		};
 		signal?.addEventListener('abort', onAbort);
 		if (signal?.aborted) {
 			controller.abort(signal.reason);
@@ -125,6 +146,7 @@ export class OllamaProvider implements ILLMProvider {
 				content: m.content
 			})),
 			stream: true,
+			think: this._config.think,
 			...(request.options?.temperature !== undefined || request.options?.maxTokens !== undefined ? {
 				options: {
 					...(request.options?.temperature !== undefined ? { temperature: request.options.temperature } : {}),
@@ -132,6 +154,11 @@ export class OllamaProvider implements ILLMProvider {
 				}
 			} : {})
 		};
+
+		// Arm initial connect and response header timeout
+		resetTimeout();
+		const streamStartTime = Date.now();
+		console.log(`[DevPilot OllamaProvider] [t=0ms] chatStream started (model="${targetModel}", think=${this._config.think})`);
 
 		try {
 			let response: Response;
@@ -146,8 +173,10 @@ export class OllamaProvider implements ILLMProvider {
 					signal: controller.signal
 				});
 			} catch (fetchErr) {
-				return this._handleFetchError(fetchErr, signal, controller);
+				return this._handleFetchError(fetchErr, signal, controller, isTimedOut);
 			}
+
+			console.log(`[DevPilot OllamaProvider] [t=${Date.now() - streamStartTime}ms] HTTP ${response.status} response headers received`);
 
 			if (!response.ok) {
 				let errorDetails = '';
@@ -211,29 +240,75 @@ export class OllamaProvider implements ILLMProvider {
 				);
 			}
 
+			// Arm activity timeout for first stream chunk
+			resetTimeout();
+
 			try {
-				return await this._consumeStream(response.body, onChunk, targetModel);
+				return await this._consumeStream(
+					response.body,
+					onChunk,
+					targetModel,
+					controller.signal,
+					resetTimeout,
+					streamStartTime
+				);
 			} catch (streamErr) {
-				return this._handleFetchError(streamErr, signal, controller);
+				return this._handleFetchError(streamErr, signal, controller, isTimedOut);
 			}
 		} finally {
-			clearTimeout(timeoutId);
+			clearTimeoutTimer();
 			signal?.removeEventListener('abort', onAbort);
+		}
+	}
+
+	private async _readNext<T>(
+		readPromise: Promise<{ done?: boolean; value?: T }>,
+		signal: AbortSignal
+	): Promise<{ done?: boolean; value?: T }> {
+		if (signal.aborted) {
+			throw signal.reason || new Error('ABORTED');
+		}
+
+		let onAbort: (() => void) | undefined;
+		try {
+			return await Promise.race([
+				readPromise,
+				new Promise<never>((_, reject) => {
+					onAbort = () => reject(signal.reason || new Error('ABORTED'));
+					signal.addEventListener('abort', onAbort, { once: true });
+				})
+			]);
+		} finally {
+			if (onAbort) {
+				signal.removeEventListener('abort', onAbort);
+			}
 		}
 	}
 
 	private async _consumeStream(
 		body: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array | string>,
 		onChunk: (chunk: StreamChunk) => void,
-		targetModel: string
+		targetModel: string,
+		streamSignal: AbortSignal,
+		onActivity: () => void,
+		streamStartTime: number = Date.now()
 	): Promise<ChatResponse> {
 		let accumulatedText = '';
 		let finishReason: ChatFinishReason = 'stop';
 		let promptEvalCount: number | undefined;
 		let evalCount: number | undefined;
+		let rawMetrics: {
+			eval_count?: unknown;
+			eval_duration?: unknown;
+			prompt_eval_count?: unknown;
+			prompt_eval_duration?: unknown;
+			total_duration?: unknown;
+			load_duration?: unknown;
+		} = {};
 		let lineBuffer = '';
 		let hasReceivedDone = false;
 		const decoder = new TextDecoder('utf-8');
+		const chunkStats = { count: 0, firstChunkLogged: false, firstContentLogged: false };
 
 		const processLines = (chunkText: string) => {
 			lineBuffer += chunkText;
@@ -262,19 +337,23 @@ export class OllamaProvider implements ILLMProvider {
 					if (meta.evalCount !== undefined) {
 						evalCount = meta.evalCount;
 					}
-				});
+					if (meta.metrics) {
+						rawMetrics = { ...rawMetrics, ...meta.metrics };
+					}
+				}, streamStartTime, chunkStats);
 			}
 		};
 
-		// Support both standard Web Streams (getReader) and AsyncIterables
+		// Support both standard Web Streams (getReader) and AsyncIterables with activity timeouts
 		if ('getReader' in body && typeof body.getReader === 'function') {
 			const reader = body.getReader();
 			try {
 				while (true) {
-					const { done, value } = await reader.read();
+					const { done, value } = await this._readNext(reader.read(), streamSignal);
 					if (done) {
 						break;
 					}
+					onActivity();
 					if (value) {
 						processLines(decoder.decode(value, { stream: true }));
 					}
@@ -283,9 +362,23 @@ export class OllamaProvider implements ILLMProvider {
 				reader.releaseLock?.();
 			}
 		} else if (body && typeof body === 'object' && Symbol.asyncIterator in body) {
-			for await (const chunk of body as AsyncIterable<Uint8Array | string>) {
-				const str = typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
-				processLines(str);
+			const iterator = (body as AsyncIterable<Uint8Array | string>)[Symbol.asyncIterator]();
+			try {
+				while (true) {
+					const { done, value } = await this._readNext(iterator.next(), streamSignal);
+					if (done) {
+						break;
+					}
+					onActivity();
+					if (value !== undefined) {
+						const str = typeof value === 'string' ? value : decoder.decode(value, { stream: true });
+						processLines(str);
+					}
+				}
+			} finally {
+				if (typeof iterator.return === 'function') {
+					await iterator.return();
+				}
 			}
 		} else {
 			throw new ProviderError('PROVIDER_ERROR', 'Unsupported response stream type received from Ollama.');
@@ -303,7 +396,16 @@ export class OllamaProvider implements ILLMProvider {
 				if (meta.doneReason) {
 					finishReason = meta.doneReason;
 				}
-			});
+				if (meta.promptEvalCount !== undefined) {
+					promptEvalCount = meta.promptEvalCount;
+				}
+				if (meta.evalCount !== undefined) {
+					evalCount = meta.evalCount;
+				}
+				if (meta.metrics) {
+					rawMetrics = { ...rawMetrics, ...meta.metrics };
+				}
+			}, streamStartTime, chunkStats);
 		}
 
 		if (!hasReceivedDone) {
@@ -313,6 +415,9 @@ export class OllamaProvider implements ILLMProvider {
 			);
 		}
 
+		console.log(`[DevPilot OllamaProvider] [t=${Date.now() - streamStartTime}ms] Stream finished (${accumulatedText.length} chars, finishReason=${finishReason})`);
+		const metrics = parseOllamaMetrics(rawMetrics);
+
 		return {
 			text: accumulatedText,
 			finishReason,
@@ -320,7 +425,8 @@ export class OllamaProvider implements ILLMProvider {
 			usage: {
 				promptTokens: promptEvalCount,
 				completionTokens: evalCount
-			}
+			},
+			...(metrics ? { metrics } : {})
 		};
 	}
 
@@ -333,15 +439,29 @@ export class OllamaProvider implements ILLMProvider {
 			doneReason?: ChatFinishReason;
 			promptEvalCount?: number;
 			evalCount?: number;
-		}) => void
+			metrics?: {
+				eval_count?: unknown;
+				eval_duration?: unknown;
+				prompt_eval_count?: unknown;
+				prompt_eval_duration?: unknown;
+				total_duration?: unknown;
+				load_duration?: unknown;
+			};
+		}) => void,
+		streamStartTime?: number,
+		chunkStats?: { count: number; firstChunkLogged: boolean; firstContentLogged: boolean }
 	): void {
 		try {
 			const parsed = JSON.parse(line) as {
-				message?: { content?: string };
+				message?: { content?: string; thinking?: string };
 				done?: boolean;
 				done_reason?: string;
 				prompt_eval_count?: number;
+				prompt_eval_duration?: number;
 				eval_count?: number;
+				eval_duration?: number;
+				total_duration?: number;
+				load_duration?: number;
 				error?: string;
 			};
 
@@ -349,8 +469,27 @@ export class OllamaProvider implements ILLMProvider {
 				throw new ProviderError('PROVIDER_ERROR', `Ollama returned error: ${parsed.error}`);
 			}
 
+			if (chunkStats && streamStartTime !== undefined) {
+				const now = Date.now() - streamStartTime;
+				if (!chunkStats.firstChunkLogged) {
+					chunkStats.firstChunkLogged = true;
+					const isThinking = Boolean(parsed.message?.thinking && parsed.message.thinking.length > 0);
+					console.log(`[DevPilot OllamaProvider] [t=${now}ms] First Ollama chunk arrived (thinking=${isThinking})`);
+				}
+			}
+
 			const content = parsed.message?.content;
 			if (typeof content === 'string' && content.length > 0) {
+				if (chunkStats && streamStartTime !== undefined) {
+					const now = Date.now() - streamStartTime;
+					chunkStats.count++;
+					if (!chunkStats.firstContentLogged) {
+						chunkStats.firstContentLogged = true;
+						console.log(`[DevPilot OllamaProvider] [t=${now}ms] First non-empty text delta arrived (${content.length} chars)`);
+					} else {
+						console.log(`[DevPilot OllamaProvider] [t=${now}ms] Ollama chunk #${chunkStats.count} emitted (${content.length} chars)`);
+					}
+				}
 				onChunk({ text: content });
 			}
 
@@ -366,7 +505,15 @@ export class OllamaProvider implements ILLMProvider {
 				done: parsed.done,
 				doneReason,
 				promptEvalCount: parsed.prompt_eval_count,
-				evalCount: parsed.eval_count
+				evalCount: parsed.eval_count,
+				metrics: {
+					eval_count: parsed.eval_count,
+					eval_duration: parsed.eval_duration,
+					prompt_eval_count: parsed.prompt_eval_count,
+					prompt_eval_duration: parsed.prompt_eval_duration,
+					total_duration: parsed.total_duration,
+					load_duration: parsed.load_duration
+				}
 			});
 		} catch (err) {
 			if (err instanceof ProviderError) {
@@ -380,7 +527,8 @@ export class OllamaProvider implements ILLMProvider {
 	private _handleFetchError(
 		err: unknown,
 		signal?: AbortSignal,
-		controller?: AbortController
+		controller?: AbortController,
+		isTimedOut?: boolean
 	): never {
 		if (signal?.aborted || (err instanceof Error && err.name === 'AbortError' && signal?.aborted)) {
 			throw new ProviderError(
@@ -390,10 +538,10 @@ export class OllamaProvider implements ILLMProvider {
 			);
 		}
 
-		if (controller?.signal.aborted && !signal?.aborted) {
+		if (isTimedOut || (err instanceof Error && err.message === 'TIMEOUT') || (controller?.signal.aborted && !signal?.aborted)) {
 			throw new ProviderError(
 				'TIMEOUT',
-				`Ollama request timed out after ${this._config.timeoutMs}ms.`,
+				`Ollama request timed out after ${this._config.timeoutMs}ms of inactivity.`,
 				{
 					userSuggestion: 'Consider increasing devpilot.ollama.timeoutMs in settings or verify server performance.',
 					cause: err
@@ -414,4 +562,87 @@ export class OllamaProvider implements ILLMProvider {
 			}
 		);
 	}
+}
+
+/**
+ * Raw metric payload shape as emitted by Ollama's /api/chat terminal response chunk.
+ */
+export interface RawOllamaMetrics {
+	readonly eval_count?: unknown;
+	readonly eval_duration?: unknown;
+	readonly prompt_eval_count?: unknown;
+	readonly prompt_eval_duration?: unknown;
+	readonly total_duration?: unknown;
+	readonly load_duration?: unknown;
+}
+
+/**
+ * Parses and validates raw Ollama response metrics into normalized GenerationMetrics.
+ * Converts nanoseconds durations to milliseconds and calculates generation tokens-per-second.
+ * Returns undefined if no valid metrics are present.
+ */
+export function parseOllamaMetrics(raw?: RawOllamaMetrics): GenerationMetrics | undefined {
+	if (!raw || typeof raw !== 'object') {
+		return undefined;
+	}
+
+	const parseCount = (val: unknown): number | undefined => {
+		if (typeof val === 'number' && Number.isFinite(val) && !Number.isNaN(val) && val >= 0) {
+			return Math.floor(val);
+		}
+		return undefined;
+	};
+
+	const parseDurationNs = (val: unknown): number | undefined => {
+		if (typeof val === 'number' && Number.isFinite(val) && !Number.isNaN(val) && val >= 0) {
+			return val;
+		}
+		return undefined;
+	};
+
+	const nsToMs = (ns: number): number => {
+		return Math.round((ns / 1_000_000) * 10) / 10;
+	};
+
+	const evalCount = parseCount(raw.eval_count);
+	const promptEvalCount = parseCount(raw.prompt_eval_count);
+
+	const evalDurationNs = parseDurationNs(raw.eval_duration);
+	const promptEvalDurationNs = parseDurationNs(raw.prompt_eval_duration);
+	const totalDurationNs = parseDurationNs(raw.total_duration);
+	const loadDurationNs = parseDurationNs(raw.load_duration);
+
+	let tokensPerSecond: number | undefined;
+	if (evalCount !== undefined && evalDurationNs !== undefined && evalDurationNs > 0) {
+		const seconds = evalDurationNs / 1_000_000_000;
+		tokensPerSecond = Math.round((evalCount / seconds) * 10) / 10;
+	}
+
+	const evalDurationMs = evalDurationNs !== undefined ? nsToMs(evalDurationNs) : undefined;
+	const promptEvalDurationMs = promptEvalDurationNs !== undefined ? nsToMs(promptEvalDurationNs) : undefined;
+	const totalDurationMs = totalDurationNs !== undefined ? nsToMs(totalDurationNs) : undefined;
+	const loadDurationMs = loadDurationNs !== undefined ? nsToMs(loadDurationNs) : undefined;
+
+	const hasAnyMetric =
+		evalCount !== undefined ||
+		evalDurationMs !== undefined ||
+		promptEvalCount !== undefined ||
+		promptEvalDurationMs !== undefined ||
+		totalDurationMs !== undefined ||
+		loadDurationMs !== undefined ||
+		tokensPerSecond !== undefined;
+
+	if (!hasAnyMetric) {
+		return undefined;
+	}
+
+	return {
+		...(evalCount !== undefined ? { evalCount } : {}),
+		...(evalDurationMs !== undefined ? { evalDurationMs } : {}),
+		...(promptEvalCount !== undefined ? { promptEvalCount } : {}),
+		...(promptEvalDurationMs !== undefined ? { promptEvalDurationMs } : {}),
+		...(totalDurationMs !== undefined ? { totalDurationMs } : {}),
+		...(loadDurationMs !== undefined ? { loadDurationMs } : {}),
+		...(tokensPerSecond !== undefined ? { tokensPerSecond } : {})
+	};
 }

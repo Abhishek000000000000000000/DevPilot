@@ -12,8 +12,10 @@ import {
 	ExtensionToWebviewMessage
 } from '../types/messages.js';
 import { ILLMProvider } from '../providers/ILLMProvider.js';
-import { ChatRequest, ChatResponse, StreamChunk, ProviderHealth } from '../providers/types.js';
+import { ChatRequest, ChatResponse, StreamChunk, ProviderHealth, GenerationMetrics } from '../providers/types.js';
 import { ProviderError } from '../providers/errors.js';
+import { OllamaProvider } from '../providers/ollama/OllamaProvider.js';
+import { getOllamaConfigFromVSCode } from '../providers/ollama/vscodeConfig.js';
 
 /**
  * Mock LLM provider for deterministic, offline testing of the extension bridge.
@@ -28,6 +30,7 @@ class MockLLMProvider implements ILLMProvider {
 	public mockChunks?: string[];
 	public mockFinishReason: 'stop' | 'length' = 'stop';
 	public mockError?: Error;
+	public mockMetrics?: GenerationMetrics;
 	public delayCompletePromise?: Promise<void>;
 	public onChunkEmitted?: () => void;
 
@@ -98,7 +101,8 @@ class MockLLMProvider implements ILLMProvider {
 			text: fullText,
 			finishReason: this.mockFinishReason,
 			model: 'mock-qwen:9b',
-			usage: { promptTokens: 10, completionTokens: 12 }
+			usage: { promptTokens: 10, completionTokens: 12 },
+			...(this.mockMetrics ? { metrics: this.mockMetrics } : {})
 		};
 	}
 }
@@ -1253,6 +1257,198 @@ suite('DevPilot Extension & Command Test Suite', () => {
 		assert.strictEqual((goodRes as ChatCompleteMessage).payload.fullText, 'Good chunk 1 Good chunk 2');
 
 		assert.strictEqual(provider.getActiveRequestCount(), 0);
+	});
+
+	test('Provider resolution: getOllamaConfigFromVSCode loads valid Ollama settings from VS Code', () => {
+		const config = getOllamaConfigFromVSCode();
+		assert.ok(config, 'Configuration must be defined');
+		assert.ok(config.baseUrl.startsWith('http'), `Base URL must be HTTP/HTTPS, got: ${config.baseUrl}`);
+		assert.ok(config.model.length > 0, `Model must be non-empty string, got: ${config.model}`);
+		assert.ok(config.timeoutMs > 0, `Timeout must be positive, got: ${config.timeoutMs}`);
+		assert.strictEqual(typeof config.think, 'boolean');
+		assert.strictEqual(config.think, false);
+	});
+
+	test('Provider resolution: DevPilotViewProvider defaults to live OllamaProvider using VS Code configuration', () => {
+		const provider = DevPilotViewProvider.currentProvider;
+		assert.ok(provider, 'Provider should be initialized');
+
+		provider.setCustomProvider(undefined);
+		const defaultProvider = provider.getProvider();
+		assert.ok(defaultProvider instanceof OllamaProvider, 'Default provider must be an OllamaProvider instance');
+		assert.strictEqual(defaultProvider.id, 'ollama');
+
+		const vsCodeConfig = getOllamaConfigFromVSCode();
+		assert.strictEqual((defaultProvider as OllamaProvider).config.baseUrl, vsCodeConfig.baseUrl);
+		assert.strictEqual((defaultProvider as OllamaProvider).config.model, vsCodeConfig.model);
+		assert.strictEqual((defaultProvider as OllamaProvider).config.timeoutMs, vsCodeConfig.timeoutMs);
+		assert.strictEqual((defaultProvider as OllamaProvider).config.think, vsCodeConfig.think);
+	});
+
+	test('Provider resolution: DevPilotViewProvider dispatches chat.send using the default configured provider', async () => {
+		const provider = DevPilotViewProvider.currentProvider;
+		assert.ok(provider, 'Provider should be initialized');
+
+		const originalFetch = globalThis.fetch;
+		let fetchCalled = false;
+		let fetchedUrl = '';
+		let fetchedBody = '';
+		try {
+			globalThis.fetch = (async (input: any, init?: any) => {
+				fetchCalled = true;
+				fetchedUrl = String(input);
+				fetchedBody = String(init?.body ?? '');
+				const encoder = new TextEncoder();
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(encoder.encode(JSON.stringify({
+							message: { role: 'assistant', content: 'Inference chunk' },
+							done: false
+						}) + '\n'));
+						controller.enqueue(encoder.encode(JSON.stringify({
+							done: true,
+							done_reason: 'stop',
+							prompt_eval_count: 5,
+							eval_count: 2
+						}) + '\n'));
+						controller.close();
+					}
+				});
+				return new Response(stream, {
+					status: 200,
+					headers: { 'Content-Type': 'application/x-ndjson' }
+				});
+			}) as typeof fetch;
+
+			provider.setCustomProvider(undefined);
+			const chunksReceived: string[] = [];
+			provider.setOnDidPostMessage(msg => {
+				if (msg.type === 'devpilot.chat.chunk') {
+					chunksReceived.push(msg.payload.text);
+				}
+			});
+
+			const response = await provider.handleMessage({
+				type: 'devpilot.chat.send',
+				payload: {
+					requestId: 'req-default-provider-test',
+					text: 'Testing default OllamaProvider invocation'
+				}
+			});
+
+			assert.strictEqual(fetchCalled, true, 'Default provider must invoke HTTP fetch');
+			assert.ok(fetchedUrl.endsWith('/api/chat'), `Must target /api/chat, got: ${fetchedUrl}`);
+			const parsedPayload = JSON.parse(fetchedBody);
+			assert.strictEqual(parsedPayload.model, 'qwen3.5:9b');
+			assert.strictEqual(parsedPayload.think, false);
+			assert.strictEqual(response?.type, 'devpilot.chat.complete');
+			assert.strictEqual((response as ChatCompleteMessage).payload.fullText, 'Inference chunk');
+			assert.deepStrictEqual(chunksReceived, ['Inference chunk']);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test('Generation metrics: complete event carries metrics payload when returned by provider', async () => {
+		const provider = DevPilotViewProvider.currentProvider;
+		assert.ok(provider);
+		provider.setCustomProvider(mockProvider);
+
+		mockProvider.mockResponseText = 'Metrics output';
+		mockProvider.mockMetrics = {
+			evalCount: 120,
+			evalDurationMs: 5000,
+			tokensPerSecond: 24,
+			promptEvalCount: 15,
+			promptEvalDurationMs: 150,
+			totalDurationMs: 5200,
+			loadDurationMs: 50
+		};
+
+		const response = await provider.handleMessage({
+			type: 'devpilot.chat.send',
+			payload: { requestId: 'req-metrics-complete', text: 'Hello' }
+		});
+
+		assert.strictEqual(response?.type, 'devpilot.chat.complete');
+		const completeMsg = response as ChatCompleteMessage;
+		assert.ok(completeMsg.payload.metrics, 'Metrics payload must be present on complete message');
+		assert.strictEqual(completeMsg.payload.metrics.evalCount, 120);
+		assert.strictEqual(completeMsg.payload.metrics.evalDurationMs, 5000);
+		assert.strictEqual(completeMsg.payload.metrics.tokensPerSecond, 24);
+		assert.strictEqual(completeMsg.payload.metrics.promptEvalCount, 15);
+		assert.strictEqual(completeMsg.payload.metrics.promptEvalDurationMs, 150);
+		assert.strictEqual(completeMsg.payload.metrics.totalDurationMs, 5200);
+		assert.strictEqual(completeMsg.payload.metrics.loadDurationMs, 50);
+	});
+
+	test('Generation metrics: complete event omits metrics field when provider does not supply metrics', async () => {
+		const provider = DevPilotViewProvider.currentProvider;
+		assert.ok(provider);
+		provider.setCustomProvider(mockProvider);
+
+		mockProvider.mockResponseText = 'No metrics output';
+		mockProvider.mockMetrics = undefined;
+
+		const response = await provider.handleMessage({
+			type: 'devpilot.chat.send',
+			payload: { requestId: 'req-no-metrics', text: 'Hello' }
+		});
+
+		assert.strictEqual(response?.type, 'devpilot.chat.complete');
+		const completeMsg = response as ChatCompleteMessage;
+		assert.strictEqual(completeMsg.payload.metrics, undefined, 'Metrics payload must be omitted when provider returns none');
+	});
+
+	test('Generation metrics: concurrent requests maintain isolated metrics payloads', async () => {
+		const provider = DevPilotViewProvider.currentProvider;
+		assert.ok(provider);
+
+		class DynamicMockProvider implements ILLMProvider {
+			public readonly id = 'dynamic-mock';
+			public readonly displayName = 'Dynamic Mock';
+			public async checkHealth(): Promise<ProviderHealth> {
+				return { isHealthy: true, availableModels: ['mock'] };
+			}
+			public async chatStream(req: ChatRequest, onChunk: (c: StreamChunk) => void): Promise<ChatResponse> {
+				const isA = req.messages[0].content.includes('ReqA');
+				onChunk({ text: isA ? 'A-text' : 'B-text' });
+				return {
+					text: isA ? 'A-text' : 'B-text',
+					finishReason: 'stop',
+					metrics: isA
+						? { evalCount: 50, evalDurationMs: 2000, tokensPerSecond: 25 }
+						: { evalCount: 100, evalDurationMs: 2500, tokensPerSecond: 40 }
+				};
+			}
+		}
+
+		provider.setCustomProvider(new DynamicMockProvider());
+
+		const [resA, resB] = await Promise.all([
+			provider.handleMessage({
+				type: 'devpilot.chat.send',
+				payload: { requestId: 'req-iso-A', text: 'ReqA' }
+			}),
+			provider.handleMessage({
+				type: 'devpilot.chat.send',
+				payload: { requestId: 'req-iso-B', text: 'ReqB' }
+			})
+		]);
+
+		assert.strictEqual(resA?.type, 'devpilot.chat.complete');
+		assert.strictEqual(resB?.type, 'devpilot.chat.complete');
+
+		const compA = resA as ChatCompleteMessage;
+		const compB = resB as ChatCompleteMessage;
+
+		assert.strictEqual(compA.payload.requestId, 'req-iso-A');
+		assert.strictEqual(compA.payload.metrics?.evalCount, 50);
+		assert.strictEqual(compA.payload.metrics?.tokensPerSecond, 25);
+
+		assert.strictEqual(compB.payload.requestId, 'req-iso-B');
+		assert.strictEqual(compB.payload.metrics?.evalCount, 100);
+		assert.strictEqual(compB.payload.metrics?.tokensPerSecond, 40);
 	});
 
 	test('deactivate executes without error', () => {

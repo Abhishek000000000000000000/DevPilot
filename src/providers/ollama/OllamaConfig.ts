@@ -5,11 +5,13 @@ export interface OllamaConfig {
 	readonly baseUrl: string;
 	readonly model: string;
 	readonly timeoutMs: number;
+	readonly think: boolean;
 }
 
 export const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
 export const DEFAULT_OLLAMA_MODEL = 'qwen3.5:9b';
 export const DEFAULT_OLLAMA_TIMEOUT_MS = 120000;
+export const DEFAULT_OLLAMA_THINK = false;
 export const MIN_TIMEOUT_MS = 1000;
 export const MAX_TIMEOUT_MS = 600000; // 10 minutes
 
@@ -52,9 +54,16 @@ export function validateOllamaConfig(config: Partial<OllamaConfig>): OllamaConfi
 	}
 	const timeoutMs = Math.floor(rawTimeout);
 
+	const rawThink = config.think ?? DEFAULT_OLLAMA_THINK;
+	if (typeof rawThink !== 'boolean') {
+		throw new Error('Ollama think option must be a boolean.');
+	}
+	const think = rawThink;
+
 	return {
 		baseUrl,
 		model,
-		timeoutMs
+		timeoutMs,
+		think
 	};
 }

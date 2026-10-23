@@ -264,7 +264,74 @@ html, body {
 .message-text {
 	white-space: pre-wrap;
 	word-break: break-word;
+	line-height: 1.55;
 }
+
+.message-text p {
+	margin: 0 0 8px 0;
+}
+
+.message-text p:last-child {
+	margin-bottom: 0;
+}
+
+.message-text strong {
+	font-weight: 600;
+	color: #ffffff;
+}
+
+.message-text em {
+	font-style: italic;
+	color: #cbd5e1;
+}
+
+.message-text code {
+	font-family: var(--font-mono, 'Cascadia Code', Consolas, 'Courier New', monospace);
+	font-size: 0.9em;
+	background: rgba(255, 255, 255, 0.08);
+	border: 1px solid rgba(255, 255, 255, 0.12);
+	border-radius: 4px;
+	padding: 1px 5px;
+	color: #e2e8f0;
+}
+
+.message-text pre {
+	background: #11151c;
+	border: 1px solid rgba(255, 255, 255, 0.1);
+	border-radius: 6px;
+	padding: 8px 12px;
+	margin: 8px 0;
+	overflow-x: auto;
+}
+
+.message-text pre code {
+	background: transparent;
+	border: none;
+	padding: 0;
+	font-size: 12px;
+	color: #f0f6fc;
+	display: block;
+	white-space: pre;
+}
+
+.message-text ul, .message-text ol {
+	margin: 4px 0 8px 0;
+	padding-left: 20px;
+}
+
+.message-text li {
+	margin-bottom: 2px;
+}
+
+.message-text h1, .message-text h2, .message-text h3, .message-text h4 {
+	font-weight: 600;
+	margin: 8px 0 4px 0;
+	color: #ffffff;
+}
+
+.message-text h1 { font-size: 15px; }
+.message-text h2 { font-size: 14px; }
+.message-text h3 { font-size: 13px; }
 
 .streaming-indicator {
 	display: inline-block;
@@ -308,9 +375,99 @@ html, body {
 	padding-top: 4px;
 }
 
+.activity-footer {
+	font-size: 11px;
+	color: var(--text-muted);
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	user-select: none;
+}
+
+.activity-footer.preparing {
+	color: var(--text-muted);
+}
+
+.activity-footer.generating {
+	color: var(--text-secondary);
+}
+
+.activity-footer.completed {
+	color: var(--text-muted);
+}
+
+.activity-footer.failed {
+	color: #fca5a5;
+	border-top-color: rgba(239, 68, 68, 0.2);
+}
+
 .message-meta.error-notice {
 	color: #fca5a5;
 	border-top-color: rgba(239, 68, 68, 0.2);
+}
+
+/* ----------------------------------------------------
+   METRICS EXPANDABLE DETAILS
+---------------------------------------------------- */
+.metrics-details {
+	margin-top: 6px;
+	padding-top: 4px;
+	font-size: 11px;
+	color: var(--text-muted);
+	border-top: 1px dashed var(--border-subtle);
+	user-select: none;
+}
+
+.metrics-summary {
+	cursor: pointer;
+	color: var(--text-secondary);
+	font-weight: 500;
+	outline: none;
+	list-style: none;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.metrics-summary::-webkit-details-marker {
+	display: none;
+}
+
+.metrics-summary::before {
+	content: '▸';
+	font-size: 10px;
+	transition: transform 0.15s ease;
+}
+
+details[open] .metrics-summary::before {
+	transform: rotate(90deg);
+}
+
+.metrics-summary:hover {
+	color: var(--accent-purple);
+}
+
+.metrics-breakdown {
+	margin-top: 6px;
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	padding-left: 8px;
+}
+
+.metrics-row {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.metrics-label {
+	color: var(--text-muted);
+}
+
+.metrics-value {
+	color: var(--text-secondary);
+	font-family: var(--font-mono, monospace);
 }
 
 @keyframes blinkCursor {
@@ -442,15 +599,16 @@ html, body {
 	display: inline-flex;
 	align-items: center;
 	gap: 4px;
-	margin-left: 8px;
-	padding: 2px 7px;
+	margin-top: 8px;
+	margin-bottom: 2px;
+	padding: 2px 8px;
 	font-size: 11px;
 	color: #f87171;
 	background: rgba(239, 68, 68, 0.12);
 	border: 1px solid rgba(239, 68, 68, 0.3);
 	border-radius: 4px;
 	cursor: pointer;
-	vertical-align: middle;
+	clear: both;
 	transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
 }
 

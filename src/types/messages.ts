@@ -74,12 +74,23 @@ export interface ChatChunkMessage {
 
 export type ChatCompleteFinishReason = 'stop' | 'length' | 'cancelled' | 'error';
 
+export interface ChatMetricsPayload {
+	readonly evalCount?: number;
+	readonly evalDurationMs?: number;
+	readonly promptEvalCount?: number;
+	readonly promptEvalDurationMs?: number;
+	readonly totalDurationMs?: number;
+	readonly loadDurationMs?: number;
+	readonly tokensPerSecond?: number;
+}
+
 export interface ChatCompleteMessage {
 	readonly type: 'devpilot.chat.complete';
 	readonly payload: {
 		readonly requestId: string;
 		readonly fullText: string;
 		readonly finishReason: ChatCompleteFinishReason;
+		readonly metrics?: ChatMetricsPayload;
 	};
 }
 

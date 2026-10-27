@@ -13,6 +13,10 @@
   "activationEvents": [
     "onView:devpilot.view",
     "onCommand:devpilot.open",
+    "onCommand:devpilot.selectProvider",
+    "onCommand:devpilot.selectModel",
+    "onCommand:devpilot.setApiKey",
+    "onCommand:devpilot.clearApiKey",
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
@@ -40,11 +44,41 @@
         "command": "devpilot.open",
         "title": "Open",
         "category": "DevPilot"
+      },
+      {
+        "command": "devpilot.selectProvider",
+        "title": "Select Active Provider",
+        "category": "DevPilot"
+      },
+      {
+        "command": "devpilot.selectModel",
+        "title": "Select Model",
+        "category": "DevPilot"
+      },
+      {
+        "command": "devpilot.setApiKey",
+        "title": "Set Provider API Key",
+        "category": "DevPilot"
+      },
+      {
+        "command": "devpilot.clearApiKey",
+        "title": "Clear Provider API Key",
+        "category": "DevPilot"
       }
     ],
     "configuration": {
       "title": "DevPilot",
       "properties": {
+        "devpilot.activeProvider": {
+          "type": "string",
+          "enum": [
+            "ollama",
+            "openai-compatible",
+            "groq"
+          ],
+          "default": "ollama",
+          "description": "Active LLM provider backend for DevPilot."
+        },
         "devpilot.ollama.baseUrl": {
           "type": "string",
           "default": "http://localhost:11434",
@@ -64,6 +98,21 @@
           "type": "boolean",
           "default": false,
           "description": "Enable internal thinking/reasoning output from reasoning-capable Ollama models. Disabling thinking significantly reduces response latency."
+        },
+        "devpilot.openaiCompatible.baseUrl": {
+          "type": "string",
+          "default": "https://api.groq.com/openai/v1",
+          "description": "Base URL of the generic OpenAI-compatible REST API (e.g., https://api.groq.com/openai/v1, https://openrouter.ai/api/v1, http://localhost:1234/v1)."
+        },
+        "devpilot.openaiCompatible.model": {
+          "type": "string",
+          "default": "openai/gpt-oss-20b",
+          "description": "Model identifier to use with the active OpenAI-compatible endpoint."
+        },
+        "devpilot.openaiCompatible.timeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "description": "Request timeout in milliseconds for OpenAI-compatible operations."
         }
       }
     }

@@ -12,8 +12,8 @@ import {
 import { ILLMProvider } from '../providers/ILLMProvider.js';
 import { ChatRequest, StreamChunk } from '../providers/types.js';
 import { ProviderError } from '../providers/errors.js';
-import { OllamaProvider } from '../providers/ollama/OllamaProvider.js';
-import { getOllamaConfigFromVSCode } from '../providers/ollama/vscodeConfig.js';
+import { ProviderFactory } from '../providers/ProviderFactory.js';
+import { SecretStorageService } from '../services/SecretStorageService.js';
 
 interface ActiveRequestRecord {
 	readonly requestId: string;
@@ -32,15 +32,24 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 
 	private _view?: vscode.WebviewView;
 	private _customProvider?: ILLMProvider;
+	private _providerFactory: ProviderFactory;
 	private _activeRequests = new Map<string, ActiveRequestRecord>();
 	private _finalizedRequests = new Map<string, 'completed' | 'cancelled' | 'error'>();
 
 	constructor(
 		private readonly _extensionUri: vscode.Uri,
-		customProvider?: ILLMProvider
+		customProvider?: ILLMProvider,
+		secretStorageService?: SecretStorageService,
+		providerFactory?: ProviderFactory
 	) {
 		DevPilotViewProvider.currentProvider = this;
 		this._customProvider = customProvider;
+		const secrets = secretStorageService ?? new SecretStorageService({
+			get: async () => undefined,
+			store: async () => {},
+			delete: async () => {}
+		});
+		this._providerFactory = providerFactory ?? new ProviderFactory(secrets);
 	}
 
 	private _recordFinalized(requestId: string, status: 'completed' | 'cancelled' | 'error'): void {
@@ -54,13 +63,33 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	/**
-	 * Retrieves the active LLM provider (custom injected or configured OllamaProvider).
+	 * Allows overriding or injecting the ProviderFactory (used for testing).
+	 */
+	public setProviderFactory(factory: ProviderFactory): void {
+		this._providerFactory = factory;
+	}
+
+	/**
+	 * Retrieves the active LLM provider.
+	 * If custom provider is set, returns custom provider.
+	 * Otherwise synchronizes with the active provider setting.
 	 */
 	public getProvider(): ILLMProvider {
 		if (this._customProvider) {
 			return this._customProvider;
 		}
-		return new OllamaProvider(getOllamaConfigFromVSCode());
+		return this._providerFactory.createSyncProvider();
+	}
+
+	/**
+	 * Asynchronously resolves the active LLM provider, ensuring secure credentials
+	 * are fetched from SecretStorageService when required by hosted providers.
+	 */
+	public async resolveProvider(): Promise<ILLMProvider> {
+		if (this._customProvider) {
+			return this._customProvider;
+		}
+		return await this._providerFactory.resolveProvider();
 	}
 
 	/**
@@ -214,7 +243,20 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 					let chunkCounter = 0;
 					console.log(`[DevPilot ViewProvider] [t=0ms] [${requestId}] Starting chatStream request`);
 
-					const provider = this.getProvider();
+					let provider: ILLMProvider;
+					try {
+						provider = await this.resolveProvider();
+					} catch (resolveErr) {
+						if (resolveErr instanceof ProviderError && resolveErr.code === 'AUTHENTICATION_FAILED') {
+							vscode.window.showErrorMessage(resolveErr.message, 'Set API Key').then(selection => {
+								if (selection === 'Set API Key') {
+									vscode.commands.executeCommand('devpilot.setApiKey');
+								}
+							});
+						}
+						throw resolveErr;
+					}
+
 					const chatRequest: ChatRequest = {
 						messages: [{ role: 'user', content: promptText }]
 					};
@@ -284,6 +326,14 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 					const code = err instanceof ProviderError ? err.code : 'PROVIDER_ERROR';
 					const messageText = err instanceof Error ? err.message : 'An unexpected error occurred.';
 					const suggestion = err instanceof ProviderError ? err.userSuggestion : undefined;
+
+					if (err instanceof ProviderError && err.code === 'MODEL_NOT_FOUND') {
+						vscode.window.showErrorMessage(err.message, 'Select Model').then(selection => {
+							if (selection === 'Select Model') {
+								vscode.commands.executeCommand('devpilot.selectModel');
+							}
+						});
+					}
 
 					const errorResponse: ChatErrorMessage = {
 						type: 'devpilot.chat.error',
@@ -356,7 +406,20 @@ export class DevPilotViewProvider implements vscode.WebviewViewProvider {
 				console.log('[DevPilot] Processing legacy message prompt...');
 
 				try {
-					const provider = this.getProvider();
+					let provider: ILLMProvider;
+					try {
+						provider = await this.resolveProvider();
+					} catch (resolveErr) {
+						if (resolveErr instanceof ProviderError && resolveErr.code === 'AUTHENTICATION_FAILED') {
+							vscode.window.showErrorMessage(resolveErr.message, 'Set API Key').then(selection => {
+								if (selection === 'Set API Key') {
+									vscode.commands.executeCommand('devpilot.setApiKey');
+								}
+							});
+						}
+						throw resolveErr;
+					}
+
 					const chatRequest: ChatRequest = {
 						messages: [{ role: 'user', content: promptText }]
 					};

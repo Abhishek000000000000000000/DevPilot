@@ -803,7 +803,7 @@ suite('DevPilot Extension & Command Test Suite', () => {
 		assert.ok(provider, 'Provider should be initialized');
 		provider.setCustomProvider(mockProvider);
 
-		mockProvider.delayCompletePromise = new Promise(() => {}); // never resolves on its own
+		mockProvider.delayCompletePromise = new Promise(() => { }); // never resolves on its own
 		mockProvider.mockResponseText = '';
 
 		const sendPromise = provider.handleMessage({
@@ -985,7 +985,7 @@ suite('DevPilot Extension & Command Test Suite', () => {
 		assert.ok(provider, 'Provider should be initialized');
 		provider.setCustomProvider(mockProvider);
 
-		mockProvider.delayCompletePromise = new Promise(() => {}); // hang
+		mockProvider.delayCompletePromise = new Promise(() => { }); // hang
 
 		const promise1 = provider.handleMessage({
 			type: 'devpilot.chat.send',

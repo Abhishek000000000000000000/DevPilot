@@ -8,7 +8,7 @@ import { OpenAICompatibleProvider } from './openai/OpenAICompatibleProvider.js';
 import { getOpenAICompatibleConfigFromVSCode } from './openai/vscodeConfig.js';
 import { SecretStorageService } from '../services/SecretStorageService.js';
 
-/**
+/*
  * Resolves and instantiates the active LLM provider adapter at runtime
  * based on VS Code configuration and secure credential storage.
  */
@@ -16,7 +16,7 @@ export class ProviderFactory {
 	constructor(
 		private readonly _secretStorage: SecretStorageService,
 		private readonly _fetchFn?: typeof fetch
-	) {}
+	) { }
 
 	/**
 	 * Retrieves the currently active provider ID configured in VS Code settings.
